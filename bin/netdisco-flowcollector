@@ -1,0 +1,362 @@
+#!/usr/bin/env perl
+
+use warnings;
+use strict;
+
+our $home;
+
+BEGIN {
+  use FindBin;
+  FindBin::again();
+
+  $home = ($ENV{NETDISCO_HOME} || $ENV{HOME});
+
+  # try to find a localenv if one isn't already in place.
+  if (!exists $ENV{PERL_LOCAL_LIB_ROOT}) {
+      use File::Spec;
+      my $localenv = File::Spec->catfile($FindBin::RealBin, 'localenv');
+      exec($localenv, $0, @ARGV) if -f $localenv;
+      $localenv = File::Spec->catfile($home, 'perl5', 'bin', 'localenv');
+      exec($localenv, $0, @ARGV) if -f $localenv;
+
+      die "Sorry, can't find libs required for App::Netdisco.\n"
+        if !exists $ENV{PERLBREW_PERL};
+  }
+}
+
+BEGIN {
+  use Path::Class;
+
+  # stuff useful locations into @INC and $PATH
+  unshift @INC,
+    dir($FindBin::RealBin)->parent->subdir('lib')->stringify,
+    dir($FindBin::RealBin, 'lib')->stringify;
+
+  unshift @INC,
+    split m/:/, ($ENV{NETDISCO_INC} || '');
+
+  use Config;
+  $ENV{PATH} = $FindBin::RealBin . $Config{path_sep} . $ENV{PATH};
+}
+
+use App::Netdisco;
+use App::Netdisco::Core::Arpnip 'store_arp';
+use App::Netdisco::Util::Node 'check_mac';
+use App::Netdisco::Util::DNS 'hostnames_resolve_async';
+use Dancer::Plugin::DBIC 'schema';
+use Dancer ':script';
+
+use Data::Printer;
+use Data::Dumper;
+use Module::Load ();
+use JSON::MaybeXS;
+use MCE::Loop Sereal => 1;
+
+use Getopt::Long;
+use Pod::Usage;
+
+Getopt::Long::Configure ("bundling");
+
+my ($debug, $sqltrace, $help) = (0, 0, 0);
+my ($bin_path, $profiles_path, $platform, $name);
+
+my $result = GetOptions(
+  'debug|D'        => \$debug,
+  'sqltrace|Q+'    => \$sqltrace,
+  'help|h'         => \$help,
+  'bin-path|b=s'   => \$bin_path,
+  'profiles-path|p=s' => \$profiles_path,
+  'platform|P=s'   => \$platform,
+  'name|n=s'       => \$name,
+) or pod2usage(
+  -msg => 'error: bad options',
+  -verbose => 0,
+  -exitval => 1,
+);
+
+pod2usage(-verbose => 1, -exitval => 0) if $help;
+
+# Set defaults
+$bin_path     ||= '/usr/local/bin/nfdump';
+$profiles_path ||= '/usr/local/nfsen/profiles-data';
+$platform     ||= 'Nfdump';
+$name         ||= 'default-flow-collector';
+
+my $CONFIG = config();
+$CONFIG->{logger} = 'console';
+$CONFIG->{log} = ($debug ? 'debug' : 'info');
+$ENV{DBIC_TRACE} ||= $sqltrace;
+
+# reconfigure logging to force console output
+Dancer::Logger->init('console', $CONFIG);
+
+MCE::Loop::init { chunk_size => 1 };
+my %stats;
+
+exit main();
+
+sub main {
+    debug "Starting flow collector with parameters:";
+    debug "  bin_path: $bin_path";
+    debug "  profiles_path: $profiles_path";
+    debug "  platform: $platform";
+    debug "  name: $name";
+
+    # Create configuration hash from CLI options
+    my @input = ({
+        name => $name,
+        bin_path => $bin_path,
+        profiles_path => $profiles_path,
+        platform => $platform,
+    });
+
+    my @mce_result = mce_loop {
+        my ($mce, $chunk_ref, $chunk_id) = @_;
+        my $config = $chunk_ref->[0];
+
+        my $label = $config->{name} || "flow-source-$chunk_id";
+
+        debug "Processing flow source: $label";
+        if ($label) {
+            MCE->gather( process($label, $config) );
+        }
+    } \@input;
+
+    debug "Completed processing, got " . scalar(@mce_result) . " results";
+
+    return 0 unless scalar @mce_result;
+
+    foreach my $host (@mce_result) {
+        $stats{host}++;
+        info sprintf ' [%s] flow - retrieved %s entries',
+            $host->[0], scalar @{$host->[1]};
+        store_flowentries($host->[1]);
+    }
+
+    info sprintf 'flow - processed %s flow entries from %s sources',
+        $stats{entry}, $stats{host};
+    return 0;
+}
+
+sub process {
+    my ($label, $args) = @_;
+
+    debug "Loading platform: " . $args->{platform};
+    my $class = "App::Netdisco::FlowCollector::Platform::".$args->{platform};
+    Module::Load::load $class;
+
+    my $device = $class->new();
+    debug "Calling collect_flows for $label";
+    my $flowentries = [ $device->collect_flows($label, $args) ];
+
+    debug "Got " . scalar(@$flowentries) . " flow entries from $label";
+
+    if (scalar @$flowentries) {
+        debug "Resolving hostnames for flow entries";
+        hostnames_resolve_async($flowentries);
+        return [$label, $flowentries];
+    }
+    else {
+        warning "WARNING: no entries received from <$label>";
+    }
+}
+
+sub store_flowentries {
+    my ($flowentries) = @_;
+
+    debug "Storing " . scalar(@$flowentries) . " flow entries";
+
+    my %known_ips = get_all_ips();
+
+    debug "Found " . scalar(keys %known_ips) . " known device IPs";
+
+    # Count MAC usage to detect router interfaces
+    my %mac_counts;
+    foreach my $flowentry (@$flowentries) {
+        my $mac = $flowentry->{mac};
+        next unless $mac && check_mac(undef, $mac);
+        $mac_counts{$mac}++;
+    }
+
+    # Identify router MACs (those with too many IP associations)
+    my %router_macs;
+    foreach my $mac (keys %mac_counts) {
+        if ($mac_counts{$mac} > 2) {  # Threshold for router interfaces
+            $router_macs{$mac} = 1;
+            debug "Identified router MAC (too many IPs): $mac with $mac_counts{$mac} IPs";
+        }
+    }
+
+    my $stored_count = 0;
+    foreach my $flowentry (@$flowentries) {
+        my ($mac, $ip) = ($flowentry->{mac}, $flowentry->{ip});
+
+        # Validate basic requirements
+        next unless $mac && $ip;
+        next unless check_mac(undef, $mac);
+
+        # Skip known device IPs (router interfaces)
+        next if exists $known_ips{$ip};
+
+        # Skip router MACs
+        next if exists $router_macs{$mac};
+
+        # Skip obviously invalid IPs
+        next if $ip eq '0.0.0.0';
+        next if $ip =~ /^127\./;  # Loopback
+        next if $ip =~ /^224\./;  # Multicast
+        next if $ip =~ /^255\./;  # Broadcast
+
+        # Skip obviously invalid MACs
+        next if $mac eq '00:00:00:00:00:00';
+        next if $mac =~ /^ff:ff:ff:ff:ff:ff/i;  # Broadcast MAC
+
+        debug sprintf '  flow - stored entry: %s / %s', $mac, $ip;
+
+        # Store as ARP entry
+        store_arp({
+            node => $mac,
+            ip => $ip,
+            dns => $flowentry->{dns} || undef,
+        });
+
+        $stored_count++;
+    }
+
+    $stats{entry} += $stored_count;
+    debug "Completed storing flow entries, stored: $stored_count, total: $stats{entry}";
+}
+
+# This is the function that will get all the IPs and aliases.
+sub get_all_ips {
+    my %known_ips;
+    my $schema = schema();
+
+    # Fetch all devices to get primary IPs and aliases
+    my @devices = $schema->resultset('Device')->all;
+    foreach my $device (@devices) {
+        my $name = $device->name;
+        my $primary_ip = $device->ip;
+        if ($primary_ip) {
+            $known_ips{$primary_ip} = $name;
+        }
+    }
+
+    # Fetch all aliased IPs and associate them with their device's alias
+    my @device_ips = $schema->resultset('DeviceIp')->all;
+    foreach my $device_ip (@device_ips) {
+        my $alias_ip = $device_ip->alias;
+        my $device = $device_ip->device;
+        if ($device) {
+            my $name = $device->name;
+            $known_ips{$alias_ip} = $name;
+        }
+    }
+
+    return %known_ips;
+}
+
+=head1 NAME
+
+netdisco-flowcollector - Collect flow data for Netdisco using nfdump
+
+=head1 SYNOPSIS
+
+netdisco-flowcollector [options]
+
+ Options:
+   -h, --help            Display this help message
+   -D, --debug           Enable debug logging
+   -Q, --sqltrace        Enable SQL tracing (can be used multiple times)
+   -b, --bin-path PATH   Path to nfdump binary (default: /usr/bin/nfdump)
+   -p, --profiles-path PATH  Path to nfdump profiles data (default: /var/nfdump/profiles-data)
+   -P, --platform NAME   Platform module to use (default: Nfdump)
+   -n, --name NAME       Name for this flow collector instance (default: default-flow-collector)
+
+=head1 DESCRIPTION
+
+Collects flow data for Netdisco from nfdump-compatible flow sources.
+Currently, flow data can be retrieved from the following sources:
+
+=over 4
+
+=item * L<App::Netdisco::FlowCollector::Platform::Nfdump> - Nfdump flow files
+
+=back
+
+The collected flow entries are then directly stored in the netdisco database.
+
+=head1 EXAMPLES
+
+ # Basic usage with defaults
+ ~/bin/netdisco-flowcollector
+
+ # Specify custom paths
+ ~/bin/netdisco-flowcollector -b /usr/local/bin/nfdump -p /data/nfsen/profiles-data
+
+ # Enable debugging
+ ~/bin/netdisco-flowcollector -D -b /usr/local/bin/nfdump
+
+=head1 DEBUG LEVELS
+
+The flags "C<-DQ>" can be specified, multiple times, and enable the following
+items in order:
+
+=over 4
+
+=item C<-D>
+
+Netdisco debug log level
+
+=item C<-Q>
+
+L<DBIx::Class> trace enabled
+
+=back
+
+=head1 DEPENDENCIES
+
+=over 4
+
+=item L<App::Netdisco>
+
+=item L<JSON::MaybeXS>
+
+=item L<MCE>
+
+=back
+
+=head1 REQUIREMENTS
+
+This utility requires:
+
+=over 4
+
+=item *
+
+nfdump binary installed and accessible
+
+=item *
+
+nfdump flow files organized in nfsen directory structure:
+profiles-data/live/switchname/year/month/day/nfcapd.YYYYMMDDHHMM
+
+=item *
+
+Read access to the profiles-data directory
+
+=item *
+
+Netdisco database configured and accessible
+
+=back
+
+=head1 AUTHOR
+
+Brian Marshall
+
+=head1 SEE ALSO
+
+L<App::Netdisco>, L<nfdump>
+
+=cut
